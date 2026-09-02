@@ -1,0 +1,9 @@
+{
+  "sectionHeading": "Mini Memo",
+  "hiddenTag": "#self",
+  "showHidden": false,
+  "historyLimitDays": 90,
+  "useDailyNotesCorePlugin": true,
+  "dailyNoteFolder": "",
+  "dailyNoteFormat": "YYYY-MM-DD"
+}

@@ -1,0 +1,10 @@
+{
+  "id": "mini-memo",
+  "name": "Mini Memo",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Capture quick memos and store them in Obsidian daily notes.",
+  "author": "xuda",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
