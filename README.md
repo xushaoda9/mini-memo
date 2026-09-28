@@ -1,6 +1,7 @@
 # Mini Memo
 
 Mini Memo 是一个轻量的 Obsidian 快速记录插件：上方快速输入，下面按时间倒序展示历史记录，记录内容写入 Obsidian 日记文档。
+<img width="2365" height="1665" alt="mini-memo" src="https://github.com/user-attachments/assets/24446bee-2fe0-4196-8194-9952c38a773c" />
 
 ## 功能
 
