@@ -2,6 +2,7 @@ const obsidian = require("obsidian");
 
 const {
   ItemView,
+  Component,
   MarkdownRenderer,
   Notice,
   Plugin,
@@ -202,11 +203,14 @@ module.exports = class MiniMemoPlugin extends Plugin {
     }
   }
 
-  async loadRecords() {
+  async loadRecords({ allHistory = false, minimumHistoryDays = 0 } = {}) {
     const config = this.getDailyNoteConfig();
     const files = this.app.vault.getMarkdownFiles();
-    const limitDays = Number(this.settings.historyLimitDays) || 0;
-    const cutoff = limitDays > 0
+    const configuredLimitDays = Number(this.settings.historyLimitDays) || 0;
+    const limitDays = configuredLimitDays > 0
+      ? Math.max(configuredLimitDays, minimumHistoryDays)
+      : 0;
+    const cutoff = !allHistory && limitDays > 0
       ? moment().startOf("day").subtract(limitDays - 1, "days")
       : null;
     const records = [];
@@ -235,7 +239,12 @@ module.exports = class MiniMemoPlugin extends Plugin {
       records.push(...parsedRecords);
     }
 
-    records.sort((a, b) => b.timestamp - a.timestamp);
+    records.sort(
+      (a, b) =>
+        b.timestamp - a.timestamp ||
+        b.sourcePosition - a.sourcePosition ||
+        b.sourcePath.localeCompare(a.sourcePath)
+    );
     return records;
   }
 
@@ -310,6 +319,12 @@ class MiniMemoView extends ItemView {
     super(leaf);
     this.plugin = plugin;
     this.records = [];
+    this.searchTimer = 0;
+    this.searchRevision = 0;
+    this.searching = false;
+    this.searchMode = false;
+    this.historyScrollTop = 0;
+    this.closed = false;
   }
 
   getViewType() {
@@ -330,6 +345,10 @@ class MiniMemoView extends ItemView {
   }
 
   async onClose() {
+    this.closed = true;
+    window.clearTimeout(this.searchTimer);
+    this.searchRevision += 1;
+    if (this.resultsComponent) this.removeChild(this.resultsComponent);
     this.contentEl.empty();
   }
 
@@ -340,6 +359,7 @@ class MiniMemoView extends ItemView {
     this.rootEl = this.contentEl.createDiv({ cls: "mini-memo" });
 
     const composerEl = this.rootEl.createDiv({ cls: "mini-memo-composer" });
+    this.composerEl = composerEl;
 
     this.inputEl = composerEl.createEl("textarea", {
       cls: "mini-memo-input",
@@ -381,10 +401,9 @@ class MiniMemoView extends ItemView {
 
     this.sendButtonEl = footerEl.createEl("button", {
       cls: "mini-memo-send-button",
-      attr: { type: "button" },
+      attr: { type: "button", title: "发送", "aria-label": "发送" },
     });
-    setIcon(this.sendButtonEl, "send-horizontal");
-    this.sendButtonEl.createSpan({ text: "发送" });
+    setIcon(this.sendButtonEl, "arrow-up");
     this.sendButtonEl.addEventListener("click", () => this.submitMemo());
 
     this.inputEl.addEventListener("input", () => this.updateSendState());
@@ -395,6 +414,7 @@ class MiniMemoView extends ItemView {
       }
     });
 
+    this.renderSearchControls();
     this.listScrollerEl = this.contentEl.createDiv({
       cls: "mini-memo-list-scroller",
     });
@@ -404,10 +424,153 @@ class MiniMemoView extends ItemView {
     this.updateSendState();
   }
 
+  renderSearchControls() {
+    const searchEl = this.rootEl.createDiv({ cls: "mini-memo-search" });
+    this.searchEl = searchEl;
+    searchEl.hidden = true;
+    const toolbar = searchEl.createDiv({ cls: "mini-memo-search-toolbar" });
+    const back = toolbar.createEl("button", {
+      cls: "mini-memo-icon-button",
+      attr: { type: "button", title: "返回记录", "aria-label": "返回记录" },
+    });
+    setIcon(back, "arrow-left");
+    back.addEventListener("click", () => this.leaveSearch());
+    const fieldEl = toolbar.createDiv({ cls: "mini-memo-search-field" });
+    setIcon(fieldEl.createSpan({ cls: "mini-memo-search-icon" }), "search");
+    this.searchInputEl = fieldEl.createEl("input", {
+      attr: { type: "text", placeholder: "搜索历史记录…", "aria-label": "搜索历史记录" },
+    });
+    this.clearSearchEl = fieldEl.createEl("button", {
+      cls: "mini-memo-search-clear",
+      attr: { type: "button", title: "清除搜索", "aria-label": "清除搜索" },
+    });
+    setIcon(this.clearSearchEl, "x");
+    this.clearSearchEl.hidden = true;
+    this.clearSearchEl.addEventListener("click", () => this.clearSearch());
+    this.searchInputEl.addEventListener("input", (event) => {
+      if (!event.isComposing) this.scheduleSearch();
+    });
+    this.searchInputEl.addEventListener("compositionend", () => this.scheduleSearch());
+    this.searchInputEl.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !event.isComposing) {
+        event.preventDefault();
+        this.clearSearch();
+      }
+    });
+
+    this.dateToggleEl = toolbar.createEl("button", {
+      cls: "mini-memo-icon-button",
+      attr: { type: "button", title: "时间筛选", "aria-label": "时间筛选", "aria-expanded": "false" },
+    });
+    setIcon(this.dateToggleEl, "calendar-days");
+    this.dateToggleEl.addEventListener("click", () => {
+      this.filterPanelEl.hidden = !this.filterPanelEl.hidden;
+      this.dateToggleEl.setAttr("aria-expanded", String(!this.filterPanelEl.hidden));
+    });
+    const metaEl = searchEl.createDiv({ cls: "mini-memo-search-meta" });
+    this.searchStatusEl = metaEl.createSpan({ attr: { role: "status", "aria-live": "polite" } });
+    this.filterPanelEl = searchEl.createDiv({ cls: "mini-memo-filter-panel" });
+    this.filterPanelEl.hidden = true;
+    this.rangeEl = this.filterPanelEl.createEl("select", { attr: { "aria-label": "时间范围" } });
+    for (const [value, text] of [["all", "全部时间"], ["7", "最近 7 天"], ["30", "最近 30 天"], ["custom", "自定义日期"]]) {
+      this.rangeEl.createEl("option", { text, value });
+    }
+    this.rangeEl.addEventListener("change", () => {
+      this.dateRangeEl.hidden = this.rangeEl.value !== "custom";
+      this.scheduleSearch(0);
+    });
+    this.dateRangeEl = this.filterPanelEl.createDiv({ cls: "mini-memo-date-range" });
+    this.dateRangeEl.hidden = true;
+    const startLabel = this.dateRangeEl.createEl("label", { text: "从" });
+    this.startDateEl = startLabel.createEl("input", { attr: { type: "date", "aria-label": "开始日期" } });
+    const endLabel = this.dateRangeEl.createEl("label", { text: "至" });
+    this.endDateEl = endLabel.createEl("input", { attr: { type: "date", "aria-label": "结束日期" } });
+    for (const input of [this.startDateEl, this.endDateEl]) {
+      input.addEventListener("change", () => this.scheduleSearch(0));
+    }
+  }
+
+  getSearchFilters() {
+    if (!this.searchMode) return { query: "", range: "all", start: "", end: "" };
+    return {
+      query: this.searchInputEl.value.trim(),
+      range: this.rangeEl.value,
+      start: this.startDateEl.value,
+      end: this.endDateEl.value,
+    };
+  }
+
+  enterSearch() {
+    if (this.searchMode) {
+      this.searchInputEl.focus();
+      return;
+    }
+    this.historyScrollTop = this.listScrollerEl.scrollTop;
+    this.searchMode = true;
+    this.composerEl.hidden = true;
+    this.searchEl.hidden = false;
+    this.searchButtonEl.setAttr("aria-pressed", "true");
+    this.searchInputEl.focus();
+    this.scheduleSearch(0);
+  }
+
+  leaveSearch() {
+    window.clearTimeout(this.searchTimer);
+    this.searchRevision += 1;
+    this.searchMode = false;
+    this.searching = false;
+    this.searchEl.hidden = true;
+    this.composerEl.hidden = false;
+    this.searchButtonEl.setAttr("aria-pressed", "false");
+    this.listEl.empty();
+    this.inputEl.focus();
+    this.loadAndRenderRecords(this.historyScrollTop);
+  }
+
+  scheduleSearch(delay = 200) {
+    window.clearTimeout(this.searchTimer);
+    this.searchRevision += 1;
+    const filters = this.getSearchFilters();
+    const active = this.searchMode || Boolean(filters.query || filters.range !== "all");
+    if (!this.searchMode && !this.searching && active) this.historyScrollTop = this.listScrollerEl.scrollTop;
+    this.searching = active;
+    this.clearSearchEl.hidden = !filters.query && filters.range === "all" && !this.searchInputEl.value;
+    if (this.dateToggleEl) {
+      this.dateToggleEl.classList.toggle("is-active", filters.range !== "all");
+      this.dateToggleEl.setAttr("title", this.rangeEl.selectedOptions[0]?.textContent || "时间筛选");
+    }
+    this.listEl.empty();
+    this.searchStatusEl.setText(active ? "正在搜索…" : "");
+    this.searchTimer = window.setTimeout(() => {
+      this.loadAndRenderRecords(active ? 0 : this.historyScrollTop);
+    }, delay);
+  }
+
+  clearSearch() {
+    this.searchInputEl.value = "";
+    this.rangeEl.value = "all";
+    this.startDateEl.value = "";
+    this.endDateEl.value = "";
+    this.dateRangeEl.hidden = true;
+    this.scheduleSearch(0);
+    this.searchInputEl.focus();
+  }
+
   renderPageControls() {
     const controlsEl = this.contentEl.createDiv({ cls: "mini-memo-page-controls" });
-
-    this.hiddenToggleEl = controlsEl.createEl("button", {
+    const actionsEl = controlsEl.createDiv({ cls: "mini-memo-page-actions" });
+    const statsEl = controlsEl.createDiv({
+      cls: "mini-memo-stats",
+      attr: { "aria-label": "笔记条数统计", "aria-live": "polite" },
+    });
+    this.statCountEls = new Map();
+    for (const days of [7, 30, 90]) {
+      const rowEl = statsEl.createDiv({ cls: "mini-memo-stat-row" });
+      rowEl.createSpan({ cls: "mini-memo-stat-label", text: `${days}天` });
+      const countEl = rowEl.createSpan({ cls: "mini-memo-stat-count", text: "—" });
+      this.statCountEls.set(days, countEl);
+    }
+    this.hiddenToggleEl = actionsEl.createEl("button", {
       cls: "mini-memo-icon-button mini-memo-hidden-toggle",
       attr: { type: "button" },
     });
@@ -416,6 +579,12 @@ class MiniMemoView extends ItemView {
       await this.plugin.saveSettings();
       await this.loadAndRenderRecords();
     });
+    this.searchButtonEl = actionsEl.createEl("button", {
+      cls: "mini-memo-icon-button",
+      attr: { type: "button", title: "搜索历史记录", "aria-label": "搜索历史记录", "aria-pressed": "false" },
+    });
+    setIcon(this.searchButtonEl, "search");
+    this.searchButtonEl.addEventListener("click", () => this.enterSearch());
   }
 
   async submitMemo() {
@@ -442,49 +611,103 @@ class MiniMemoView extends ItemView {
     }
   }
 
-  async loadAndRenderRecords() {
-    if (!this.listEl) {
+  async loadAndRenderRecords(scrollTop = this.listScrollerEl?.scrollTop || 0) {
+    if (!this.listEl || this.closed) {
       return;
     }
 
-    this.records = await this.plugin.loadRecords();
-    await this.renderRecords();
+    const revision = ++this.searchRevision;
+    const filters = this.getSearchFilters();
+    const active = this.searchMode || Boolean(filters.query || filters.range !== "all");
+    try {
+      const records = await this.plugin.loadRecords({ allHistory: active, minimumHistoryDays: 90 });
+      if (revision !== this.searchRevision || this.closed) return;
+      this.statsRecords = records;
+      const limitDays = Number(this.plugin.settings.historyLimitDays) || 0;
+      const cutoff = !active && limitDays > 0
+        ? moment().startOf("day").subtract(limitDays - 1, "days").format("YYYY-MM-DD")
+        : null;
+      this.records = cutoff ? records.filter((record) => record.date >= cutoff) : records;
+      await this.renderRecords(revision, filters, scrollTop);
+    } catch (error) {
+      if (revision !== this.searchRevision || this.closed) return;
+      console.error(error);
+      for (const countEl of this.statCountEls.values()) countEl.setText("—");
+      this.listEl.empty();
+      this.searchStatusEl.setText("读取记录失败，请重试");
+      const retry = this.listEl.createEl("button", { text: "重试" });
+      retry.addEventListener("click", () => this.loadAndRenderRecords(scrollTop));
+    }
   }
 
-  async renderRecords() {
-    this.listEl.empty();
+  async renderRecords(revision, filters, scrollTop) {
     this.updateHiddenToggle();
-
-    const hiddenTag = this.plugin.getHiddenTag();
-    const visibleRecords = this.records.filter((record) => {
-      if (this.plugin.settings.showHidden) {
-        return true;
-      }
-      return !record.text.includes(hiddenTag);
+    const active = this.searchMode || Boolean(filters.query || filters.range !== "all");
+    const invalidRange = filters.range === "custom" && filters.start && filters.end && filters.start > filters.end;
+    const visibleRecords = invalidRange ? [] : filterMemoRecords(this.records, {
+      ...filters,
+      showHidden: this.plugin.settings.showHidden,
+      hiddenTag: this.plugin.getHiddenTag(),
     });
+    const container = this.listEl.ownerDocument.createElement("div");
+    const component = new Component();
+    this.addChild(component);
+    let committed = false;
+    try {
 
     if (!visibleRecords.length) {
-      this.listEl.createDiv({
+      container.createDiv({
         cls: "mini-memo-empty",
-        text: "还没有记录",
+        text: invalidRange ? "开始日期不能晚于结束日期" : active ? "没有找到匹配的记录" : "还没有记录",
       });
-      return;
+      if (active) {
+        const clear = container.createEl("button", { text: "清除搜索", cls: "mini-memo-empty-clear" });
+        clear.addEventListener("click", () => this.clearSearch());
+      }
     }
 
     for (const record of visibleRecords) {
-      const itemEl = this.listEl.createDiv({ cls: "mini-memo-item" });
+      const itemEl = container.createDiv({ cls: "mini-memo-item" });
       const textEl = itemEl.createDiv({ cls: "mini-memo-item-text" });
       await MarkdownRenderer.render(
         this.app,
         normalizeMemoMediaSpacing(record.text),
         textEl,
         record.sourcePath,
-        this
+        component
       );
-      itemEl.createDiv({
+      if (revision !== this.searchRevision || this.closed) return;
+      highlightMemoMatches(textEl, filters.query);
+
+      const footerEl = itemEl.createDiv({ cls: "mini-memo-item-footer" });
+      footerEl.createDiv({
         cls: "mini-memo-item-time",
         text: formatRecordTime(record),
       });
+
+      const forwardButtonEl = footerEl.createEl("button", {
+        cls: "mini-memo-item-forward-button",
+        attr: {
+          type: "button",
+          title: "引用这条记录",
+          "aria-label": "引用这条记录",
+        },
+      });
+      setIcon(forwardButtonEl, "forward");
+      forwardButtonEl.addEventListener("click", () => {
+        this.quoteRecord(record);
+      });
+    }
+    if (revision !== this.searchRevision || this.closed) return;
+    if (this.resultsComponent) this.removeChild(this.resultsComponent);
+    this.resultsComponent = component;
+    this.listEl.replaceChildren(...Array.from(container.childNodes));
+    this.searchStatusEl.setText(invalidRange ? "日期范围无效" : active ? `找到 ${visibleRecords.length} 条记录` : "");
+    this.listScrollerEl.scrollTop = scrollTop;
+    this.updateRecordStats();
+    committed = true;
+    } finally {
+      if (!committed) this.removeChild(component);
     }
   }
 
@@ -505,6 +728,16 @@ class MiniMemoView extends ItemView {
     this.hiddenToggleEl.setAttr("aria-pressed", showHidden ? "true" : "false");
     this.hiddenToggleEl.setAttr("aria-label", label);
     this.hiddenToggleEl.setAttr("title", label);
+  }
+
+  updateRecordStats() {
+    const counts = countRecentMemoRecords(this.statsRecords || [], {
+      showHidden: this.plugin.settings.showHidden,
+      hiddenTag: this.plugin.getHiddenTag(),
+    });
+    for (const [days, countEl] of this.statCountEls) {
+      countEl.setText(`${counts[days]}条`);
+    }
   }
 
   updateSendState() {
@@ -541,6 +774,21 @@ class MiniMemoView extends ItemView {
       this.updateSendState();
       this.inputEl.focus();
     }
+  }
+
+  quoteRecord(record) {
+    const quote = createMemoQuote(record.text);
+
+    if (this.searchMode) {
+      this.leaveSearch();
+      this.inputEl.value = this.inputEl.value.trim() ? `${this.inputEl.value}\n${quote}` : quote;
+    } else {
+      this.inputEl.value = quote;
+    }
+    this.inputEl.focus();
+    this.inputEl.setSelectionRange(0, 0);
+    this.inputEl.scrollTop = 0;
+    this.updateSendState();
   }
 
   insertTextAtCursor(text) {
@@ -729,12 +977,18 @@ function parseMemoItems(section, noteDate, sourcePath) {
   const records = [];
   let currentRecord = null;
 
-  for (const line of lines) {
+  for (const [sourcePosition, line] of lines.entries()) {
     const item = /^-\s+(?:\[[ xX]\]\s+)?(\d{1,2}:\d{2})\s*(.*)$/.exec(line);
 
     if (item) {
       pushRecord(records, currentRecord);
-      currentRecord = createRecord(noteDate, item[1], item[2], sourcePath);
+      currentRecord = createRecord(
+        noteDate,
+        item[1],
+        item[2],
+        sourcePath,
+        sourcePosition
+      );
       continue;
     }
 
@@ -747,10 +1001,11 @@ function parseMemoItems(section, noteDate, sourcePath) {
   return records;
 }
 
-function createRecord(noteDate, time, text, sourcePath) {
+function createRecord(noteDate, time, text, sourcePath, sourcePosition) {
   const timestamp = moment(
     `${noteDate.format("YYYY-MM-DD")} ${time}`,
-    "YYYY-MM-DD H:mm",
+    // Written times use HH:mm; also accept older, unpadded hours.
+    ["YYYY-MM-DD HH:mm", "YYYY-MM-DD H:mm"],
     true
   ).valueOf();
 
@@ -760,6 +1015,7 @@ function createRecord(noteDate, time, text, sourcePath) {
     date: noteDate.format("YYYY-MM-DD"),
     timestamp,
     sourcePath,
+    sourcePosition,
   };
 }
 
@@ -863,6 +1119,74 @@ function normalizeMemoMediaSpacing(text) {
     /\n(?:[ \t]*\n)+([ \t]*(?:!\[\[|!\[[^\]\n]*\]\(|<img\b))/gi,
     "\n$1"
   );
+}
+
+function createMemoQuote(text) {
+  const content = normalizeMemoMediaSpacing(text).trim();
+
+  return ` @ ${content}`;
+}
+
+function countRecentMemoRecords(records, { showHidden, hiddenTag }, today = moment()) {
+  const end = today.format("YYYY-MM-DD");
+  const counts = { 7: 0, 30: 0, 90: 0 };
+  const starts = Object.keys(counts).map((days) => [
+    days,
+    today.clone().startOf("day").subtract(Number(days) - 1, "days").format("YYYY-MM-DD"),
+  ]);
+  for (const record of records) {
+    if (record.date > end || (!showHidden && record.text.includes(hiddenTag))) continue;
+    for (const [days, start] of starts) {
+      if (record.date >= start) counts[days] += 1;
+    }
+  }
+  return counts;
+}
+
+function filterMemoRecords(records, filters) {
+  const query = filters.query.toLowerCase();
+  let start = filters.range === "custom" ? filters.start : "";
+  let end = filters.range === "custom" ? filters.end : "";
+  if (filters.range === "7" || filters.range === "30") {
+    start = moment().startOf("day").subtract(Number(filters.range) - 1, "days").format("YYYY-MM-DD");
+    end = moment().format("YYYY-MM-DD");
+  }
+  return records.filter((record) =>
+    (filters.showHidden || !record.text.includes(filters.hiddenTag)) &&
+    (!query || record.text.toLowerCase().includes(query)) &&
+    (!start || record.date >= start) &&
+    (!end || record.date <= end)
+  );
+}
+
+function highlightMemoMatches(element, query) {
+  if (!query) return;
+  const doc = element.ownerDocument;
+  const walker = doc.createTreeWalker(element, 4);
+  const nodes = [];
+  while (walker.nextNode()) {
+    if (!walker.currentNode.parentElement.closest("script, style, textarea, mark")) {
+      nodes.push(walker.currentNode);
+    }
+  }
+  const pattern = new RegExp(escapeRegExp(query), "gi");
+  for (const node of nodes) {
+    const text = node.nodeValue;
+    const fragment = doc.createDocumentFragment();
+    let offset = 0;
+    for (const match of text.matchAll(pattern)) {
+      fragment.append(doc.createTextNode(text.slice(offset, match.index)));
+      const mark = doc.createElement("mark");
+      mark.className = "mini-memo-search-match";
+      mark.textContent = match[0];
+      fragment.append(mark);
+      offset = match.index + match[0].length;
+    }
+    if (offset) {
+      fragment.append(doc.createTextNode(text.slice(offset)));
+      node.replaceWith(fragment);
+    }
+  }
 }
 
 function escapeRegExp(value) {
